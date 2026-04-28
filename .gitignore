@@ -1,0 +1,9 @@
+# Editor / OS junk
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Backups created by migrate-aliases.sh (won't appear in repo, but just in case)
+*.claude-restore-bak.*

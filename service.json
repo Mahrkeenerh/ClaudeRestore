@@ -1,0 +1,25 @@
+{
+  "name": "ClaudeRestore",
+  "version": "0.1.0",
+  "description": "Restore Claude Code terminal sessions across PC restarts",
+  "type": "application",
+
+  "systemd": null,
+
+  "network": {
+    "port": null,
+    "health": null
+  },
+
+  "paths": {
+    "config": null,
+    "logs": "journalctl",
+    "install": "install.sh",
+    "uninstall": "uninstall.sh"
+  },
+
+  "ui": {
+    "icon": "🔁",
+    "category": "AI"
+  }
+}

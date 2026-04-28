@@ -1,0 +1,365 @@
+#!/bin/bash
+# cr — Claude Restore: track and restore Claude Code terminal sessions across reboots.
+#
+# Subcommands:
+#   cr                    Auto-restore all sessions from the previous boot,
+#                         skipping any session_ids already alive in this boot.
+#   cr restore            Interactive picker (cherry-pick what to restore).
+#   cr restore --all      Same as `cr` (no prompt).
+#   cr wrap [args...]     Internal — invoked by the claude shell aliases.
+#                         Wraps `claude` with heartbeat tracking.
+#   cr status             Show registry: live this boot + restorable from previous.
+#   cr clean              Garbage-collect stale entries.
+#   cr help               This message.
+
+set -e
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$SELF")"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+. "$REPO_DIR/lib/common.sh"
+
+# Resolve the real claude binary, ignoring this script if `cr` is on PATH ahead of it.
+# The user's `claude` binary lives at ~/.local/bin/claude (Anthropic installer default);
+# we never shadow it.
+cr_real_claude() {
+    local candidate
+    candidate="$(command -v claude 2>/dev/null || true)"
+    if [ -n "$candidate" ] && [ "$(readlink -f "$candidate")" != "$(readlink -f "$SCRIPT_DIR/cr")" ]; then
+        echo "$candidate"
+        return 0
+    fi
+    # Fallback: known Anthropic installer location.
+    if [ -x "$HOME/.local/bin/claude" ]; then
+        echo "$HOME/.local/bin/claude"
+        return 0
+    fi
+    echo "ERROR: real 'claude' binary not found on PATH" >&2
+    return 1
+}
+
+# ─── wrap ───────────────────────────────────────────────────────────────────────
+cmd_wrap() {
+    local real_claude
+    real_claude="$(cr_real_claude)" || exit 127
+
+    cr_ensure_registry
+    local handoff_dir="${XDG_RUNTIME_DIR:-/tmp}/claude-restore"
+    mkdir -p "$handoff_dir"
+    chmod 700 "$handoff_dir"
+    local handoff
+    handoff="$(mktemp "$handoff_dir/handoff.XXXXXX")"
+    export CR_HANDOFF="$handoff"
+    export CR_WRAPPER_PID="$$"
+
+    local wrapper_starttime
+    wrapper_starttime="$(cr_pid_starttime "$$")"
+
+    # Heartbeat loop: parent-PID + starttime check defeats PID reuse.
+    (
+        local sid="" hb=""
+        while cr_pid_alive "$CR_WRAPPER_PID" "$wrapper_starttime"; do
+            if [ -z "$sid" ] && [ -s "$CR_HANDOFF" ]; then
+                sid="$(cat "$CR_HANDOFF")"
+                hb="$(cr_session_heartbeat "$sid")"
+            fi
+            if [ -n "$hb" ] && [ -e "$hb" ]; then
+                touch "$hb"
+            fi
+            sleep "$CR_HEARTBEAT_INTERVAL"
+        done
+        rm -f "$CR_HANDOFF"
+    ) &
+    disown
+
+    exec "$real_claude" "$@"
+}
+
+# ─── helpers for restore/status/clean ──────────────────────────────────────────
+
+# Iterate session info files, emitting "<sid> <info_path> <heartbeat_path>" per line.
+cr_iter_sessions() {
+    [ -d "$CR_REGISTRY" ] || return 0
+    local d info hb sid
+    for d in "$CR_REGISTRY"/*/; do
+        [ -d "$d" ] || continue
+        sid="$(basename "$d")"
+        info="$d/info.json"
+        hb="$d/heartbeat"
+        [ -f "$info" ] || continue
+        echo "$sid $info $hb"
+    done
+}
+
+# Classify a session entry. Echoes one of: live | dead-this-boot | restore | stale | missing-jsonl.
+# Args: info_path heartbeat_path current_boot_id
+cr_classify() {
+    local info="$1" hb="$2" current_boot="$3"
+    local entry_boot pid pid_starttime cwd sid
+    entry_boot="$(jq -r '.boot_id' "$info")"
+    pid="$(jq -r '.pid' "$info")"
+    pid_starttime="$(jq -r '.pid_starttime // empty' "$info")"
+    cwd="$(jq -r '.cwd' "$info")"
+    sid="$(jq -r '.session_id' "$info")"
+
+    # Verify the .jsonl transcript still exists; without it `--resume` fails.
+    local proj_dir transcript_count
+    proj_dir="$HOME/.claude/projects/$(echo "$cwd" | sed 's|/|-|g; s|^-|-|')"
+    transcript_count=0
+    [ -f "$proj_dir/$sid.jsonl" ] && transcript_count=1
+
+    if [ "$entry_boot" = "$current_boot" ]; then
+        if cr_pid_alive "$pid" "$pid_starttime"; then
+            echo "live"
+        else
+            echo "dead-this-boot"
+        fi
+        return
+    fi
+
+    if [ "$transcript_count" = "0" ]; then
+        echo "missing-jsonl"
+        return
+    fi
+
+    local hb_epoch boot_end_epoch gap
+    hb_epoch="$(cr_heartbeat_epoch "$hb")"
+    boot_end_epoch="$(cr_boot_last_entry_epoch "$entry_boot")"
+    if [ -z "$hb_epoch" ] || [ -z "$boot_end_epoch" ]; then
+        # No anchor → conservative: include as restore candidate.
+        echo "restore"
+        return
+    fi
+    gap=$(( boot_end_epoch - hb_epoch ))
+    [ "$gap" -lt 0 ] && gap=$(( -gap ))
+    if [ "$gap" -le "$CR_RESTORE_THRESHOLD_SEC" ]; then
+        echo "restore"
+    else
+        echo "stale"
+    fi
+}
+
+# Returns 0 if any live entry has the given session_id.
+cr_session_id_live() {
+    local target="$1" current_boot
+    current_boot="$(cr_boot_id)"
+    cr_iter_sessions | while read -r sid info hb; do
+        [ "$sid" = "$target" ] || continue
+        [ "$(cr_classify "$info" "$hb" "$current_boot")" = "live" ] && exit 0
+    done
+    [ $? -eq 0 ]
+}
+
+# Spawn a terminal in cwd running `claude --resume <sid>`. Best-effort terminal pick.
+cr_spawn_session() {
+    local cwd="$1" sid="$2" terminal_hint="$3" cmd
+    cmd="claude --resume $sid"
+    local term="${CR_TERMINAL:-$terminal_hint}"
+
+    case "$term" in
+        kitty)
+            kitty --detach --directory "$cwd" -- bash -ic "$cmd; exec bash" ;;
+        alacritty)
+            setsid alacritty --working-directory "$cwd" -e bash -ic "$cmd; exec bash" >/dev/null 2>&1 < /dev/null & ;;
+        wezterm|wezterm-gui)
+            wezterm start --cwd "$cwd" -- bash -ic "$cmd; exec bash" ;;
+        konsole)
+            setsid konsole --workdir "$cwd" -e bash -ic "$cmd; exec bash" >/dev/null 2>&1 < /dev/null & ;;
+        gnome-terminal-|gnome-terminal-server|gnome-terminal)
+            gnome-terminal --working-directory="$cwd" -- bash -ic "$cmd; exec bash" ;;
+        cosmic-term|cosmic-terminal)
+            setsid cosmic-term --working-directory "$cwd" -- bash -ic "$cmd; exec bash" >/dev/null 2>&1 < /dev/null & ;;
+        terminator)
+            terminator --working-directory="$cwd" -e "bash -ic '$cmd; exec bash'" & ;;
+        tilix)
+            tilix --working-directory="$cwd" -e "bash -ic '$cmd; exec bash'" & ;;
+        ghostty)
+            ghostty --working-directory="$cwd" -e "bash -ic '$cmd; exec bash'" & ;;
+        foot)
+            foot --working-directory="$cwd" bash -ic "$cmd; exec bash" & ;;
+        xterm)
+            xterm -e "bash -ic 'cd \"$cwd\" && $cmd; exec bash'" & ;;
+        *)
+            for t in kitty alacritty wezterm konsole gnome-terminal foot xterm; do
+                if command -v "$t" >/dev/null 2>&1; then
+                    cr_spawn_session "$cwd" "$sid" "$t"
+                    return $?
+                fi
+            done
+            echo "  ERROR: no known terminal emulator found" >&2
+            return 1
+            ;;
+    esac
+}
+
+# ─── restore ────────────────────────────────────────────────────────────────────
+
+# Build candidate list. Echoes "<sid>|<cwd>|<terminal>|<hb_epoch>|<boot_id>" per line.
+cr_collect_candidates() {
+    local current_boot live_sids
+    current_boot="$(cr_boot_id)"
+    live_sids="$(cr_iter_sessions | while read -r sid info hb; do
+        [ "$(cr_classify "$info" "$hb" "$current_boot")" = "live" ] && echo "$sid"
+    done)"
+
+    cr_iter_sessions | while read -r sid info hb; do
+        local class
+        class="$(cr_classify "$info" "$hb" "$current_boot")"
+        [ "$class" = "restore" ] || continue
+        # Skip if this session_id is currently live.
+        if echo "$live_sids" | grep -qx "$sid"; then continue; fi
+        local cwd term hb_epoch eboot
+        cwd="$(jq -r '.cwd' "$info")"
+        term="$(jq -r '.terminal' "$info")"
+        hb_epoch="$(cr_heartbeat_epoch "$hb")"
+        eboot="$(jq -r '.boot_id' "$info")"
+        echo "$sid|$cwd|$term|$hb_epoch|$eboot"
+    done
+}
+
+cmd_restore_auto() {
+    local candidates count
+    candidates="$(cr_collect_candidates)"
+    count=$(echo -n "$candidates" | grep -c '^' || true)
+    if [ "$count" -eq 0 ]; then
+        echo "Nothing to restore."
+        return 0
+    fi
+    echo "Restoring $count session(s):"
+    echo "$candidates" | while IFS='|' read -r sid cwd term hb eboot; do
+        local hb_human
+        hb_human="$(date -d "@$hb" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "?")"
+        echo "  • $cwd  [last alive $hb_human, terminal=$term]"
+        cr_spawn_session "$cwd" "$sid" "$term" || echo "    (spawn failed)"
+    done
+}
+
+cmd_restore_pick() {
+    local candidates rows i sid cwd term hb eboot hb_human first_prompt sel
+    candidates="$(cr_collect_candidates)"
+    if [ -z "$candidates" ]; then
+        echo "Nothing to restore."
+        return 0
+    fi
+
+    echo "Restorable sessions:"
+    echo
+    i=0
+    declare -a CHOICES=()
+    while IFS='|' read -r sid cwd term hb eboot; do
+        i=$((i + 1))
+        hb_human="$(date -d "@$hb" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "?")"
+        local proj_dir transcript first_prompt
+        proj_dir="$HOME/.claude/projects/$(echo "$cwd" | sed 's|/|-|g; s|^-|-|')"
+        transcript="$proj_dir/$sid.jsonl"
+        first_prompt=""
+        if [ -f "$transcript" ]; then
+            first_prompt="$(jq -r 'select(.type=="user") | .message.content[0].text? // .message.content? // empty' "$transcript" 2>/dev/null | head -1 | head -c 80)"
+        fi
+        printf "  [%d] %s\n      last alive: %s | terminal: %s\n" "$i" "$cwd" "$hb_human" "$term"
+        [ -n "$first_prompt" ] && printf "      first prompt: %s\n" "$first_prompt"
+        echo
+        CHOICES+=("$sid|$cwd|$term")
+    done <<< "$candidates"
+
+    echo "Select sessions to restore (e.g. '1 3 4', 'all', or empty to cancel):"
+    read -r sel
+
+    [ -z "$sel" ] && { echo "Cancelled."; return 0; }
+
+    local indices
+    if [ "$sel" = "all" ]; then
+        indices="$(seq 1 ${#CHOICES[@]})"
+    else
+        indices="$sel"
+    fi
+
+    for idx in $indices; do
+        if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt "${#CHOICES[@]}" ]; then
+            echo "  skip: invalid '$idx'"
+            continue
+        fi
+        IFS='|' read -r sid cwd term <<< "${CHOICES[$((idx - 1))]}"
+        echo "  • restoring $cwd"
+        cr_spawn_session "$cwd" "$sid" "$term" || echo "    (spawn failed)"
+    done
+}
+
+# ─── status ─────────────────────────────────────────────────────────────────────
+cmd_status() {
+    local current_boot
+    current_boot="$(cr_boot_id)"
+    cr_ensure_registry
+
+    local n=0
+    echo "=== Live (this boot) ==="
+    cr_iter_sessions | while read -r sid info hb; do
+        local class cwd
+        class="$(cr_classify "$info" "$hb" "$current_boot")"
+        [ "$class" = "live" ] || continue
+        cwd="$(jq -r '.cwd' "$info")"
+        echo "  $sid  $cwd"
+    done
+
+    echo
+    echo "=== Restorable (from previous boots) ==="
+    cr_iter_sessions | while read -r sid info hb; do
+        local class cwd hb_epoch hb_human
+        class="$(cr_classify "$info" "$hb" "$current_boot")"
+        [ "$class" = "restore" ] || continue
+        cwd="$(jq -r '.cwd' "$info")"
+        hb_epoch="$(cr_heartbeat_epoch "$hb")"
+        hb_human="$(date -d "@$hb_epoch" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "?")"
+        echo "  $sid  $cwd  [$hb_human]"
+    done
+
+    echo
+    echo "=== Stale (will be GC'd by 'cr clean') ==="
+    cr_iter_sessions | while read -r sid info hb; do
+        local class cwd
+        class="$(cr_classify "$info" "$hb" "$current_boot")"
+        case "$class" in stale|dead-this-boot|missing-jsonl) ;; *) continue ;; esac
+        cwd="$(jq -r '.cwd' "$info")"
+        echo "  [$class]  $sid  $cwd"
+    done
+}
+
+# ─── clean ──────────────────────────────────────────────────────────────────────
+cmd_clean() {
+    local current_boot removed=0
+    current_boot="$(cr_boot_id)"
+    cr_iter_sessions | while read -r sid info hb; do
+        local class
+        class="$(cr_classify "$info" "$hb" "$current_boot")"
+        case "$class" in
+            stale|dead-this-boot|missing-jsonl)
+                rm -rf "$(cr_session_dir "$sid")"
+                echo "  removed [$class]: $sid"
+                ;;
+        esac
+    done
+}
+
+# ─── dispatch ───────────────────────────────────────────────────────────────────
+cmd="${1:-}"
+case "$cmd" in
+    "")           cmd_restore_auto ;;
+    wrap)         shift; cmd_wrap "$@" ;;
+    restore)
+        shift
+        if [ "${1:-}" = "--all" ]; then
+            cmd_restore_auto
+        else
+            cmd_restore_pick
+        fi
+        ;;
+    status)       cmd_status ;;
+    clean)        cmd_clean ;;
+    help|-h|--help)
+        sed -n '2,/^$/p' "$0" | sed 's|^# \?||'
+        ;;
+    *)
+        echo "Unknown subcommand: $cmd" >&2
+        echo "Try: cr help" >&2
+        exit 2
+        ;;
+esac
