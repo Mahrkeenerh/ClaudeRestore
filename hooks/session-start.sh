@@ -16,8 +16,12 @@ if [ -z "$sid" ]; then
     exit 0
 fi
 
-# PPID of the hook is the claude process — same PID as the wrapper after exec.
-wrapper_pid="$PPID"
+# Prefer CR_WRAPPER_PID (set by `cr wrap` before exec, inherited by claude).
+# Fall back to $PPID only when claude is run without the wrapper — note that
+# Claude Code invokes hooks via an intermediate `sh -c`, so $PPID is that
+# transient shell, not claude itself, and the entry will appear dead the
+# moment the hook returns.
+wrapper_pid="${CR_WRAPPER_PID:-$PPID}"
 wrapper_starttime="$(cr_pid_starttime "$wrapper_pid" || echo "")"
 boot_id="$(cr_boot_id)"
 terminal="$(cr_detect_terminal "$wrapper_pid")"
