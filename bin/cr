@@ -55,12 +55,17 @@ cmd_wrap() {
     wrapper_starttime="$(cr_pid_starttime "$$")"
 
     # Heartbeat loop: parent-PID + starttime check defeats PID reuse.
+    # Re-read CR_HANDOFF each tick: /clear, /compact, and /resume produce a
+    # fresh session_id mid-wrapper, and we must follow it.
     (
-        local sid="" hb=""
+        local sid="" hb="" current_sid=""
         while cr_pid_alive "$CR_WRAPPER_PID" "$wrapper_starttime"; do
-            if [ -z "$sid" ] && [ -s "$CR_HANDOFF" ]; then
-                sid="$(cat "$CR_HANDOFF")"
-                hb="$(cr_session_heartbeat "$sid")"
+            if [ -s "$CR_HANDOFF" ]; then
+                current_sid="$(cat "$CR_HANDOFF")"
+                if [ -n "$current_sid" ] && [ "$current_sid" != "$sid" ]; then
+                    sid="$current_sid"
+                    hb="$(cr_session_heartbeat "$sid")"
+                fi
             fi
             if [ -n "$hb" ] && [ -e "$hb" ]; then
                 touch "$hb"
@@ -150,10 +155,13 @@ cr_session_id_live() {
     [ $? -eq 0 ]
 }
 
-# Spawn a terminal in cwd running `claude --resume <sid>`. Best-effort terminal pick.
+# Spawn a terminal in cwd running `cr wrap --resume <sid>`. Best-effort terminal pick.
+# Uses `cr wrap` (not bare `claude`) so the restored session gets a heartbeat
+# goroutine and CR_HANDOFF — without that, the session is invisible to the
+# next boot's restore.
 cr_spawn_session() {
     local cwd="$1" sid="$2" terminal_hint="$3" cmd
-    cmd="claude --resume $sid"
+    cmd="cr wrap --resume $sid"
     local term="${CR_TERMINAL:-$terminal_hint}"
 
     case "$term" in
