@@ -103,7 +103,8 @@ cr_classify() {
 
     # Verify the .jsonl transcript still exists; without it `--resume` fails.
     local proj_dir transcript_count
-    proj_dir="$HOME/.claude/projects/$(echo "$cwd" | sed 's|/|-|g; s|^-|-|')"
+    # Claude Code encodes the cwd by mapping '/', '_', and '.' to '-'.
+    proj_dir="$HOME/.claude/projects/$(echo "$cwd" | sed 's|[/._]|-|g')"
     transcript_count=0
     [ -f "$proj_dir/$sid.jsonl" ] && transcript_count=1
 
@@ -249,7 +250,7 @@ cmd_restore_pick() {
         i=$((i + 1))
         hb_human="$(date -d "@$hb" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "?")"
         local proj_dir transcript first_prompt
-        proj_dir="$HOME/.claude/projects/$(echo "$cwd" | sed 's|/|-|g; s|^-|-|')"
+        proj_dir="$HOME/.claude/projects/$(echo "$cwd" | sed 's|[/._]|-|g')"
         transcript="$proj_dir/$sid.jsonl"
         first_prompt=""
         if [ -f "$transcript" ]; then
