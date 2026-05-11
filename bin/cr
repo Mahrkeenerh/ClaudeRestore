@@ -96,9 +96,19 @@ cr_iter_sessions() {
 }
 
 # Classify a session entry. Echoes one of: live | dead-this-boot | restore | stale | missing-jsonl.
-# Args: info_path heartbeat_path current_boot_id
+# Args: info_path heartbeat_path current_boot_id [user_login_epoch]
+#
+# user_login_epoch (optional): epoch of the current user-login start, from
+# cr_user_login_epoch. Used to split same-boot PID-dead entries into:
+#   - heartbeat >= login_epoch → wrapper died within the current login session
+#     (user closed the terminal) → dead-this-boot
+#   - heartbeat <  login_epoch → wrapper died across a login boundary
+#     (X/Wayland crash, user-space restart) → restore
+# When empty (loginctl unavailable / no qualifying session), we cannot
+# distinguish the two and conservatively classify all same-boot PID-dead
+# entries as restore.
 cr_classify() {
-    local info="$1" hb="$2" current_boot="$3"
+    local info="$1" hb="$2" current_boot="$3" user_login_epoch="${4:-}"
     local entry_boot pid pid_starttime cwd sid
     entry_boot="$(jq -r '.boot_id' "$info")"
     pid="$(jq -r '.pid' "$info")"
@@ -116,8 +126,23 @@ cr_classify() {
     if [ "$entry_boot" = "$current_boot" ]; then
         if cr_pid_alive "$pid" "$pid_starttime"; then
             echo "live"
-        else
+            return
+        fi
+        # PID is dead this boot. Clean exits fire SessionEnd which removes the
+        # entry, so the entry's mere existence means the wrapper died without a
+        # user-initiated exit. Split by login boundary if we can.
+        if [ "$transcript_count" = "0" ]; then
+            echo "missing-jsonl"
+            return
+        fi
+        local hb_epoch
+        hb_epoch="$(cr_heartbeat_epoch "$hb")"
+        if [ -n "$user_login_epoch" ] && [ -n "$hb_epoch" ] && [ "$hb_epoch" -ge "$user_login_epoch" ]; then
+            # Wrapper died within the current login session — user closed it.
             echo "dead-this-boot"
+        else
+            # Wrapper died across a login boundary, or we can't tell — restore.
+            echo "restore"
         fi
         return
     fi
@@ -146,11 +171,12 @@ cr_classify() {
 
 # Returns 0 if any live entry has the given session_id.
 cr_session_id_live() {
-    local target="$1" current_boot
+    local target="$1" current_boot login_epoch
     current_boot="$(cr_boot_id)"
+    login_epoch="$(cr_user_login_epoch)"
     cr_iter_sessions | while read -r sid info hb; do
         [ "$sid" = "$target" ] || continue
-        [ "$(cr_classify "$info" "$hb" "$current_boot")" = "live" ] && exit 0
+        [ "$(cr_classify "$info" "$hb" "$current_boot" "$login_epoch")" = "live" ] && exit 0
     done
     [ $? -eq 0 ]
 }
@@ -204,15 +230,16 @@ cr_spawn_session() {
 
 # Build candidate list. Echoes "<sid>|<cwd>|<terminal>|<hb_epoch>|<boot_id>" per line.
 cr_collect_candidates() {
-    local current_boot live_sids
+    local current_boot login_epoch live_sids
     current_boot="$(cr_boot_id)"
+    login_epoch="$(cr_user_login_epoch)"
     live_sids="$(cr_iter_sessions | while read -r sid info hb; do
-        [ "$(cr_classify "$info" "$hb" "$current_boot")" = "live" ] && echo "$sid"
+        [ "$(cr_classify "$info" "$hb" "$current_boot" "$login_epoch")" = "live" ] && echo "$sid"
     done)"
 
     cr_iter_sessions | while read -r sid info hb; do
         local class
-        class="$(cr_classify "$info" "$hb" "$current_boot")"
+        class="$(cr_classify "$info" "$hb" "$current_boot" "$login_epoch")"
         [ "$class" = "restore" ] || continue
         # Skip if this session_id is currently live.
         if echo "$live_sids" | grep -qx "$sid"; then continue; fi
@@ -295,25 +322,25 @@ cmd_restore_pick() {
 
 # ─── status ─────────────────────────────────────────────────────────────────────
 cmd_status() {
-    local current_boot
+    local current_boot login_epoch
     current_boot="$(cr_boot_id)"
+    login_epoch="$(cr_user_login_epoch)"
     cr_ensure_registry
 
-    local n=0
     echo "=== Live (this boot) ==="
     cr_iter_sessions | while read -r sid info hb; do
         local class cwd
-        class="$(cr_classify "$info" "$hb" "$current_boot")"
+        class="$(cr_classify "$info" "$hb" "$current_boot" "$login_epoch")"
         [ "$class" = "live" ] || continue
         cwd="$(jq -r '.cwd' "$info")"
         echo "  $sid  $cwd"
     done
 
     echo
-    echo "=== Restorable (from previous boots) ==="
+    echo "=== Restorable ==="
     cr_iter_sessions | while read -r sid info hb; do
         local class cwd hb_epoch hb_human
-        class="$(cr_classify "$info" "$hb" "$current_boot")"
+        class="$(cr_classify "$info" "$hb" "$current_boot" "$login_epoch")"
         [ "$class" = "restore" ] || continue
         cwd="$(jq -r '.cwd' "$info")"
         hb_epoch="$(cr_heartbeat_epoch "$hb")"
@@ -325,7 +352,7 @@ cmd_status() {
     echo "=== Stale (will be GC'd by 'cr clean') ==="
     cr_iter_sessions | while read -r sid info hb; do
         local class cwd
-        class="$(cr_classify "$info" "$hb" "$current_boot")"
+        class="$(cr_classify "$info" "$hb" "$current_boot" "$login_epoch")"
         case "$class" in stale|dead-this-boot|missing-jsonl) ;; *) continue ;; esac
         cwd="$(jq -r '.cwd' "$info")"
         echo "  [$class]  $sid  $cwd"
@@ -334,11 +361,12 @@ cmd_status() {
 
 # ─── clean ──────────────────────────────────────────────────────────────────────
 cmd_clean() {
-    local current_boot removed=0
+    local current_boot login_epoch
     current_boot="$(cr_boot_id)"
+    login_epoch="$(cr_user_login_epoch)"
     cr_iter_sessions | while read -r sid info hb; do
         local class
-        class="$(cr_classify "$info" "$hb" "$current_boot")"
+        class="$(cr_classify "$info" "$hb" "$current_boot" "$login_epoch")"
         case "$class" in
             stale|dead-this-boot|missing-jsonl)
                 rm -rf "$(cr_session_dir "$sid")"

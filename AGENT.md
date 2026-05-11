@@ -20,7 +20,7 @@ journalctl -t claude-restore   # hook diagnostic logs
 ## Files
 
 - `bin/cr` — main entry, dispatches subcommands
-- `lib/common.sh` — shared helpers (boot_id, terminal detection, journalctl parsing, heartbeat ops)
+- `lib/common.sh` — shared helpers (boot_id, terminal detection, journalctl parsing, user-login epoch via loginctl, heartbeat ops)
 - `hooks/session-start.sh` — Claude SessionStart hook: writes registry entry, publishes session_id to `$CR_HANDOFF`
 - `hooks/session-end.sh` — Claude SessionEnd hook: removes registry entry on clean exit
 - `scripts/migrate-aliases.sh` — optional in-place rewrite of `claude`→`cr wrap` in user's `~/.bash_aliases`
@@ -35,14 +35,45 @@ journalctl -t claude-restore   # hook diagnostic logs
 
 ## How restoration decides
 
-For each registry entry from a *previous* boot:
+`cr_classify` has two branches based on whether the registry entry was created
+in the current kernel boot.
+
+### Same-boot entries (recovers user-space restarts)
+
+Within a boot, PID/starttime liveness is meaningful, so we use it directly:
+
+1. PID alive (and starttime matches) → `live`.
+2. PID dead, no transcript → `missing-jsonl`.
+3. PID dead, heartbeat ≥ user_login_epoch → `dead-this-boot`. The wrapper
+   died inside the current user-login session — user closed the terminal.
+4. PID dead, heartbeat < user_login_epoch → `restore`. The wrapper died
+   crossing a user-login boundary — X/Wayland crash, display-manager
+   restart, logout/login — every previous-login terminal is dead.
+
+`user_login_epoch` is the max `Timestamp` among the current user's
+non-empty-`Seat` logind sessions (filters out remote-desktop pseudo-sessions
+like chrome-remote-desktop). Empty if loginctl is unavailable, in which case
+we fall back to "any same-boot PID-dead → restore" (potential false-positive
+restores, but no lost work).
+
+### Previous-boot entries (recovers full reboots)
+
 1. Look up `info.boot_id`'s last journal entry: `journalctl --list-boots` → last column.
 2. `gap = | boot_last_entry_epoch − heartbeat_mtime |`
-3. Restore iff `gap ≤ $CR_RESTORE_THRESHOLD_SEC` (default 30s).
+3. Restore iff `gap ≤ $CR_RESTORE_THRESHOLD_SEC` (default 30s); else `stale`.
 
 This works because: if the system died with the wrapper still running, its
 last heartbeat is within ~5s of journalctl's last recorded moment. A session
 closed long before shutdown has a heartbeat far before the boot's end.
+
+### The SessionEnd hook is preserve-by-default
+
+Only `clear|resume|prompt_input_exit|bypass_permissions_disabled` cause the
+hook to remove the registry entry. Every other `exit_reason` (including
+empty/unset, which is what fires on session-manager crash) preserves the
+entry — `cr_classify` then decides restorability. This matters because Claude
+Code fires SessionEnd with `exit_reason=""` on display-server crashes; a
+strict deny-list previously wiped the entries before they could be recovered.
 
 ## Troubleshooting
 

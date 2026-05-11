@@ -59,6 +59,32 @@ cr_detect_terminal() {
     echo "unknown"
 }
 
+# Epoch of the user's most recent local-seat logind session start.
+# Used to distinguish wrapper deaths within the current user-login (user closed
+# the terminal — don't restore) from wrapper deaths that crossed a user-login
+# boundary (X/Wayland crash, user-space restart — restore).
+# Filters on non-empty Seat to exclude remote-desktop pseudo-sessions
+# (chrome-remote-desktop, xrdp) that don't tear down our local terminals.
+# Returns empty if loginctl is unavailable or no qualifying session exists —
+# callers should fall back to "treat same-boot dead as restorable" in that case.
+cr_user_login_epoch() {
+    command -v loginctl >/dev/null 2>&1 || { echo ""; return 1; }
+    local uid newest=0 sid sess_uid seat ts epoch
+    uid="$(id -u)"
+    while read -r sid _; do
+        [ -z "$sid" ] && continue
+        sess_uid="$(loginctl show-session "$sid" -p User --value 2>/dev/null)"
+        [ "$sess_uid" = "$uid" ] || continue
+        seat="$(loginctl show-session "$sid" -p Seat --value 2>/dev/null)"
+        [ -n "$seat" ] || continue
+        ts="$(loginctl show-session "$sid" -p Timestamp --value 2>/dev/null)"
+        [ -n "$ts" ] || continue
+        epoch="$(date -d "$ts" +%s 2>/dev/null)"
+        [ -n "$epoch" ] && [ "$epoch" -gt "$newest" ] && newest=$epoch
+    done < <(loginctl list-sessions --no-legend 2>/dev/null)
+    [ "$newest" -gt 0 ] && echo "$newest" || echo ""
+}
+
 # Parse `journalctl --list-boots` plain-text output (json mode unsupported on systemd<252).
 # Format: "IDX BOOT_ID Day YYYY-MM-DD HH:MM:SS TZ—Day YYYY-MM-DD HH:MM:SS TZ"
 # Returns epoch seconds of the last entry for the given boot_id, or empty if not found.
