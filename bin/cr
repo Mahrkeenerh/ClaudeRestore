@@ -95,18 +95,25 @@ cr_iter_sessions() {
     done
 }
 
-# Classify a session entry. Echoes one of: live | dead-this-boot | restore | stale | missing-jsonl.
+# Classify a session entry. Echoes one of:
+#   live | dead-this-boot | crash-restorable | stale | missing-jsonl
 # Args: info_path heartbeat_path current_boot_id [user_login_epoch]
+#
+# This is a PER-ENTRY verdict: `crash-restorable` means the wrapper was alive
+# when its boot (or login session) died. Whether a crash-restorable entry is
+# actually restored is decided afterwards by cr_final_class against the target
+# boot — only the most-recent boot that has any crash-restorable session is
+# restored, so older boots' survivors don't pile up across reboots.
 #
 # user_login_epoch (optional): epoch of the current user-login start, from
 # cr_user_login_epoch. Used to split same-boot PID-dead entries into:
 #   - heartbeat >= login_epoch → wrapper died within the current login session
 #     (user closed the terminal) → dead-this-boot
 #   - heartbeat <  login_epoch → wrapper died across a login boundary
-#     (X/Wayland crash, user-space restart) → restore
+#     (X/Wayland crash, user-space restart) → crash-restorable
 # When empty (loginctl unavailable / no qualifying session), we cannot
 # distinguish the two and conservatively classify all same-boot PID-dead
-# entries as restore.
+# entries as crash-restorable.
 cr_classify() {
     local info="$1" hb="$2" current_boot="$3" user_login_epoch="${4:-}"
     local entry_boot pid pid_starttime cwd sid
@@ -141,8 +148,9 @@ cr_classify() {
             # Wrapper died within the current login session — user closed it.
             echo "dead-this-boot"
         else
-            # Wrapper died across a login boundary, or we can't tell — restore.
-            echo "restore"
+            # Wrapper died across a login boundary, or we can't tell — it was
+            # alive when this login crashed (X/Wayland/user-space restart).
+            echo "crash-restorable"
         fi
         return
     fi
@@ -156,16 +164,62 @@ cr_classify() {
     hb_epoch="$(cr_heartbeat_epoch "$hb")"
     boot_end_epoch="$(cr_boot_last_entry_epoch "$entry_boot")"
     if [ -z "$hb_epoch" ] || [ -z "$boot_end_epoch" ]; then
-        # No anchor → conservative: include as restore candidate.
-        echo "restore"
+        # No anchor — the boot has aged out of the journal (older than journal
+        # retention) or its heartbeat is gone. Either way it is not a recent
+        # crash, so it must NOT resurrect. Classify stale, never restore.
+        echo "stale"
         return
     fi
     gap=$(( boot_end_epoch - hb_epoch ))
     [ "$gap" -lt 0 ] && gap=$(( -gap ))
     if [ "$gap" -le "$CR_RESTORE_THRESHOLD_SEC" ]; then
-        echo "restore"
+        # Heartbeat is within threshold of the boot's death — alive at crash.
+        echo "crash-restorable"
     else
         echo "stale"
+    fi
+}
+
+# The single boot we restore from: the MOST RECENT boot (by journal index) that
+# has at least one crash-restorable session. This is the walk-back — if the
+# previous boot crashed before any session was opened (no crash-restorable
+# entries), we fall through to the boot before it, and so on. The current boot
+# wins automatically when present (rank 0), so a user-space crash that didn't
+# reboot takes precedence over older boots. Echoes the boot_id, or empty.
+# Args: current_boot_id user_login_epoch
+cr_target_boot() {
+    local current_boot="$1" login_epoch="$2"
+    local best_boot="" best_rank="" eboot rank label
+    cr_iter_sessions | {
+        while read -r sid info hb; do
+            label="$(cr_classify "$info" "$hb" "$current_boot" "$login_epoch")"
+            [ "$label" = "crash-restorable" ] || continue
+            eboot="$(jq -r '.boot_id' "$info")"
+            rank="$(cr_boot_rank "$eboot" "$current_boot")"
+            [ -z "$rank" ] && continue
+            if [ -z "$best_rank" ] || [ "$rank" -gt "$best_rank" ]; then
+                best_rank="$rank"; best_boot="$eboot"
+            fi
+        done
+        echo "$best_boot"
+    }
+}
+
+# Resolve a per-entry cr_classify label into a final disposition given the
+# target boot: a crash-restorable entry becomes `restore` only on the target
+# boot, otherwise `stale` (a survivor of an older boot, already superseded).
+# Non-restorable labels pass through unchanged.
+# Args: classify_label entry_boot_id target_boot_id
+cr_final_class() {
+    local label="$1" eboot="$2" target="$3"
+    if [ "$label" = "crash-restorable" ]; then
+        if [ -n "$target" ] && [ "$eboot" = "$target" ]; then
+            echo "restore"
+        else
+            echo "stale"
+        fi
+    else
+        echo "$label"
     fi
 }
 
@@ -230,24 +284,28 @@ cr_spawn_session() {
 
 # Build candidate list. Echoes "<sid>|<cwd>|<terminal>|<hb_epoch>|<boot_id>" per line.
 cr_collect_candidates() {
-    local current_boot login_epoch live_sids
+    local current_boot login_epoch target_boot live_sids
     current_boot="$(cr_boot_id)"
     login_epoch="$(cr_user_login_epoch)"
+    # Resolve the journal boot list once; subshells below inherit the cache.
+    CR_BOOTS_CACHE="$(journalctl --list-boots 2>/dev/null)"
+    target_boot="$(cr_target_boot "$current_boot" "$login_epoch")"
     live_sids="$(cr_iter_sessions | while read -r sid info hb; do
         [ "$(cr_classify "$info" "$hb" "$current_boot" "$login_epoch")" = "live" ] && echo "$sid"
     done)"
 
     cr_iter_sessions | while read -r sid info hb; do
-        local class
+        local class final eboot
         class="$(cr_classify "$info" "$hb" "$current_boot" "$login_epoch")"
-        [ "$class" = "restore" ] || continue
+        eboot="$(jq -r '.boot_id' "$info")"
+        final="$(cr_final_class "$class" "$eboot" "$target_boot")"
+        [ "$final" = "restore" ] || continue
         # Skip if this session_id is currently live.
         if echo "$live_sids" | grep -qx "$sid"; then continue; fi
-        local cwd term hb_epoch eboot
+        local cwd term hb_epoch
         cwd="$(jq -r '.cwd' "$info")"
         term="$(jq -r '.terminal' "$info")"
         hb_epoch="$(cr_heartbeat_epoch "$hb")"
-        eboot="$(jq -r '.boot_id' "$info")"
         echo "$sid|$cwd|$term|$hb_epoch|$eboot"
     done
 }
@@ -322,9 +380,11 @@ cmd_restore_pick() {
 
 # ─── status ─────────────────────────────────────────────────────────────────────
 cmd_status() {
-    local current_boot login_epoch
+    local current_boot login_epoch target_boot
     current_boot="$(cr_boot_id)"
     login_epoch="$(cr_user_login_epoch)"
+    CR_BOOTS_CACHE="$(journalctl --list-boots 2>/dev/null)"
+    target_boot="$(cr_target_boot "$current_boot" "$login_epoch")"
     cr_ensure_registry
 
     echo "=== Live (this boot) ==="
@@ -339,9 +399,11 @@ cmd_status() {
     echo
     echo "=== Restorable ==="
     cr_iter_sessions | while read -r sid info hb; do
-        local class cwd hb_epoch hb_human
+        local class final cwd eboot hb_epoch hb_human
         class="$(cr_classify "$info" "$hb" "$current_boot" "$login_epoch")"
-        [ "$class" = "restore" ] || continue
+        eboot="$(jq -r '.boot_id' "$info")"
+        final="$(cr_final_class "$class" "$eboot" "$target_boot")"
+        [ "$final" = "restore" ] || continue
         cwd="$(jq -r '.cwd' "$info")"
         hb_epoch="$(cr_heartbeat_epoch "$hb")"
         hb_human="$(date -d "@$hb_epoch" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "?")"
@@ -351,26 +413,32 @@ cmd_status() {
     echo
     echo "=== Stale (will be GC'd by 'cr clean') ==="
     cr_iter_sessions | while read -r sid info hb; do
-        local class cwd
+        local class final cwd eboot
         class="$(cr_classify "$info" "$hb" "$current_boot" "$login_epoch")"
-        case "$class" in stale|dead-this-boot|missing-jsonl) ;; *) continue ;; esac
+        eboot="$(jq -r '.boot_id' "$info")"
+        final="$(cr_final_class "$class" "$eboot" "$target_boot")"
+        case "$final" in stale|dead-this-boot|missing-jsonl) ;; *) continue ;; esac
         cwd="$(jq -r '.cwd' "$info")"
-        echo "  [$class]  $sid  $cwd"
+        echo "  [$final]  $sid  $cwd"
     done
 }
 
 # ─── clean ──────────────────────────────────────────────────────────────────────
 cmd_clean() {
-    local current_boot login_epoch
+    local current_boot login_epoch target_boot
     current_boot="$(cr_boot_id)"
     login_epoch="$(cr_user_login_epoch)"
+    CR_BOOTS_CACHE="$(journalctl --list-boots 2>/dev/null)"
+    target_boot="$(cr_target_boot "$current_boot" "$login_epoch")"
     cr_iter_sessions | while read -r sid info hb; do
-        local class
+        local class final eboot
         class="$(cr_classify "$info" "$hb" "$current_boot" "$login_epoch")"
-        case "$class" in
+        eboot="$(jq -r '.boot_id' "$info")"
+        final="$(cr_final_class "$class" "$eboot" "$target_boot")"
+        case "$final" in
             stale|dead-this-boot|missing-jsonl)
                 rm -rf "$(cr_session_dir "$sid")"
-                echo "  removed [$class]: $sid"
+                echo "  removed [$final]: $sid"
                 ;;
         esac
     done

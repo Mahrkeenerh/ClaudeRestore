@@ -92,7 +92,17 @@ the system died with the session still open, the last heartbeat is within ~5s
 of the system's actual death, which is essentially what
 `journalctl --list-boots` records as the boot's "last entry." A session closed
 hours before shutdown has a heartbeat hours before the boot's last entry → big
-gap → not restored.
+gap → not restored. A boot so old it has aged out of `journalctl --list-boots`
+has no anchor at all → its entries are treated as stale, never restored.
+
+An entry that passes the gap test is *alive-at-crash*, but that alone doesn't
+restore it. Registry entries pile up (a single boot can run for weeks), so `cr`
+restores only the sessions from **one boot**: the most recent boot that has any
+alive-at-crash session. Survivors of older boots are superseded → stale. This
+is also a **walk-back** — if the previous boot crashed before any session was
+open, `cr` falls through to the boot before it, and so on, until it finds a
+boot that actually had a live session. A user-space crash that never rebooted
+(same boot) takes precedence over any earlier boot.
 
 For each restore candidate, `cr` (or `cr restore`) launches a new terminal
 window in the recorded `cwd` running `claude --resume <session_id>`. The

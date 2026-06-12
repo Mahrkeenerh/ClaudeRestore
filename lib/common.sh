@@ -85,12 +85,22 @@ cr_user_login_epoch() {
     [ "$newest" -gt 0 ] && echo "$newest" || echo ""
 }
 
+# Cached `journalctl --list-boots` output. Classification touches this once per
+# registry entry (often 100+), so we resolve it a single time per command. The
+# cache lives in the calling shell; command-substitution subshells inherit it.
+cr_boots_list() {
+    if [ -z "${CR_BOOTS_CACHE+x}" ]; then
+        CR_BOOTS_CACHE="$(journalctl --list-boots 2>/dev/null)"
+    fi
+    printf '%s\n' "$CR_BOOTS_CACHE"
+}
+
 # Parse `journalctl --list-boots` plain-text output (json mode unsupported on systemd<252).
 # Format: "IDX BOOT_ID Day YYYY-MM-DD HH:MM:SS TZ—Day YYYY-MM-DD HH:MM:SS TZ"
 # Returns epoch seconds of the last entry for the given boot_id, or empty if not found.
 cr_boot_last_entry_epoch() {
     local target="$1" line last_str
-    line="$(journalctl --list-boots 2>/dev/null | awk -v b="$target" '$2 == b')"
+    line="$(cr_boots_list | awk -v b="$target" '$2 == b')"
     [ -z "$line" ] && { echo ""; return 1; }
     # Extract everything after the em-dash (—, U+2014).
     last_str="${line##*—}"
@@ -98,6 +108,16 @@ cr_boot_last_entry_epoch() {
     last_str="${last_str#"${last_str%%[![:space:]]*}"}"
     [ -z "$last_str" ] && { echo ""; return 1; }
     date -d "$last_str" +%s 2>/dev/null
+}
+
+# Recency rank of a boot: its `journalctl --list-boots` index (0 = current boot,
+# -1 = immediately previous, -2 = before that, …). Higher = more recent. Empty
+# if the boot has aged out of the journal (no anchor → never restorable).
+cr_boot_rank() {
+    local b="$1" current="$2" idx
+    [ "$b" = "$current" ] && { echo 0; return 0; }
+    idx="$(cr_boots_list | awk -v b="$b" '$2 == b {print $1; exit}')"
+    [ -n "$idx" ] && echo "$idx"
 }
 
 cr_ensure_registry() {

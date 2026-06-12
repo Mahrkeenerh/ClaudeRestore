@@ -46,25 +46,47 @@ Within a boot, PID/starttime liveness is meaningful, so we use it directly:
 2. PID dead, no transcript → `missing-jsonl`.
 3. PID dead, heartbeat ≥ user_login_epoch → `dead-this-boot`. The wrapper
    died inside the current user-login session — user closed the terminal.
-4. PID dead, heartbeat < user_login_epoch → `restore`. The wrapper died
-   crossing a user-login boundary — X/Wayland crash, display-manager
+4. PID dead, heartbeat < user_login_epoch → `crash-restorable`. The wrapper
+   died crossing a user-login boundary — X/Wayland crash, display-manager
    restart, logout/login — every previous-login terminal is dead.
 
 `user_login_epoch` is the max `Timestamp` among the current user's
 non-empty-`Seat` logind sessions (filters out remote-desktop pseudo-sessions
 like chrome-remote-desktop). Empty if loginctl is unavailable, in which case
-we fall back to "any same-boot PID-dead → restore" (potential false-positive
-restores, but no lost work).
+we fall back to "any same-boot PID-dead → crash-restorable" (potential
+false-positive restores, but no lost work).
 
 ### Previous-boot entries (recovers full reboots)
 
 1. Look up `info.boot_id`'s last journal entry: `journalctl --list-boots` → last column.
 2. `gap = | boot_last_entry_epoch − heartbeat_mtime |`
-3. Restore iff `gap ≤ $CR_RESTORE_THRESHOLD_SEC` (default 30s); else `stale`.
+3. `crash-restorable` iff `gap ≤ $CR_RESTORE_THRESHOLD_SEC` (default 30s); else `stale`.
+4. No anchor (boot has aged out of `journalctl --list-boots`, or heartbeat
+   missing) → `stale`. An entry that old must never resurrect — this was the
+   cause of the "restored way too many sessions" bug, where every accumulated
+   entry from a rotated-out boot lit up as a restore candidate.
 
 This works because: if the system died with the wrapper still running, its
 last heartbeat is within ~5s of journalctl's last recorded moment. A session
 closed long before shutdown has a heartbeat far before the boot's end.
+
+### `crash-restorable` is per-entry; the target boot decides what actually restores
+
+`cr_classify` only says whether an entry was alive when *its own* boot/login
+died. It does **not** decide restoration. `cr_target_boot` then picks the
+single boot we restore from: the **most recent boot (by `journalctl` index)
+that has any `crash-restorable` entry**. `cr_final_class` maps each entry to
+its final verdict — `crash-restorable` on the target boot → `restore`; on any
+older boot → `stale` (superseded).
+
+Why: registry entries accumulate (preserve-by-default SessionEnd, manual GC),
+and a long-lived boot can hold a *month* of dead entries. Without this scoping,
+every reboot re-offered survivors from every past boot, ballooning the restore
+list. The target-boot rule is also a **walk-back**: if the immediately previous
+boot crashed before any session was alive (no `crash-restorable` entries), the
+rank search naturally falls through to the boot before it, and so on. The
+current boot has rank 0 (highest), so a user-space crash that didn't reboot
+takes precedence over any earlier boot.
 
 ### The SessionEnd hook is preserve-by-default
 
